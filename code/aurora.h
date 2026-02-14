@@ -29,3 +29,18 @@
 #include <linux/mm_types.h>
 #include <linux/mmap_lock.h>
 #endif
+
+// perf硬件断点相关
+#include <linux/perf_event.h>
+#include <linux/hw_breakpoint.h>
+
+// 硬件断点结构定义
+typedef struct _HW_BREAKPOINT {
+    pid_t pid;                    // 目标线程PID
+    uintptr_t addr;                // 断点地址
+    int type;                      // 断点类型 (HW_BREAKPOINT_X, HW_BREAKPOINT_R, HW_BREAKPOINT_W)
+    int len;                       // 断点长度 (1,2,4,8)
+} HW_BREAKPOINT, *PHW_BREAKPOINT;
+
+// 全局Hook PC值声明
+extern atomic64_t g_hook_pc;
