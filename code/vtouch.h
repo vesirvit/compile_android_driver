@@ -1,4 +1,7 @@
-// virtual_touch.c
+// vtouch.h - Virtual Touchscreen 驱动头文件
+#ifndef _VTOUCH_H
+#define _VTOUCH_H
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -7,8 +10,14 @@
 #include <linux/device.h>
 #include <linux/uaccess.h>
 #include <linux/input.h>
+#include <linux/input/mt.h>
 #include <linux/slab.h>
 #include <linux/ioctl.h>
+#include <linux/err.h>
+#include <linux/version.h>
+#ifdef CONFIG_COMPAT
+#include <linux/compat.h>
+#endif
 
 #define DEVICE_NAME "vtouch"
 #define CLASS_NAME "vtouch_class"
@@ -35,3 +44,5 @@ struct vtouch_dev {
     int last_x;
     int last_y;
 };
+
+#endif /* _VTOUCH_H */

@@ -1,31 +1,36 @@
+// virtual_touch.c
 #include "vtouch.h"
 
 static struct vtouch_dev *vtouch_device;
 static struct class *vtouch_class;
 static dev_t dev_num;
 
-// 发送触摸事件
+// 发送触摸事件（Type B 协议，正确的事件顺序）
 static void send_touch_event(struct vtouch_dev *dev, int x, int y, int pressure, int active)
 {
     if (!dev->input)
         return;
 
-    // 上报X坐标
-    input_report_abs(dev->input, ABS_MT_POSITION_X, x);
-    // 上报Y坐标
-    input_report_abs(dev->input, ABS_MT_POSITION_Y, y);
-    // 上报压力值
-    input_report_abs(dev->input, ABS_MT_PRESSURE, pressure);
-    // 上报跟踪ID（用于多点触摸，这里固定为0）
-    input_report_abs(dev->input, ABS_MT_TRACKING_ID, 0);
-    
-    // 上报触摸槽位
+    // 1. 选择触摸槽位
     input_mt_slot(dev->input, 0);
+
+    // 2. 上报槽位状态（按下时内核自动分配 TRACKING_ID，抬起时自动发送 -1）
     input_mt_report_slot_state(dev->input, MT_TOOL_FINGER, active);
-    
-    // 同步事件
+
+    if (active) {
+        // 3. 上报坐标和压力
+        input_report_abs(dev->input, ABS_MT_POSITION_X, x);
+        input_report_abs(dev->input, ABS_MT_POSITION_Y, y);
+        input_report_abs(dev->input, ABS_MT_PRESSURE, pressure);
+    }
+
+    // 4. 上报按键状态（用户态程序依赖 BTN_TOUCH 判断触摸有无）
+    input_report_key(dev->input, BTN_TOUCH, active);
+    input_report_key(dev->input, BTN_TOOL_FINGER, active);
+
+    // 5. 同步事件
     input_sync(dev->input);
-    
+
     // 保存当前状态
     dev->touch_active = active;
     if (active) {
@@ -102,13 +107,14 @@ static int vtouch_open(struct inode *inode, struct file *file)
 static int vtouch_release(struct inode *inode, struct file *file)
 {
     struct vtouch_dev *dev = file->private_data;
-    
+    (void)inode;
+
     // 如果触摸还处于激活状态，自动释放
     if (dev->touch_active) {
         pr_info("vtouch: auto-releasing touch on close\n");
         send_touch_event(dev, dev->last_x, dev->last_y, 0, 0);
     }
-    
+
     pr_info("vtouch: device closed\n");
     return 0;
 }
@@ -119,6 +125,9 @@ static const struct file_operations vtouch_fops = {
     .open = vtouch_open,
     .release = vtouch_release,
     .unlocked_ioctl = vtouch_ioctl,
+#ifdef CONFIG_COMPAT
+    .compat_ioctl = compat_ptr_ioctl,
+#endif
 };
 
 // 初始化输入设备
@@ -150,15 +159,21 @@ static int vtouch_input_init(struct vtouch_dev *dev)
     __set_bit(BTN_TOUCH, input->keybit);
     __set_bit(BTN_TOOL_FINGER, input->keybit);
 
-    // 设置绝对坐标范围
+    // 设置绝对坐标范围（Android 会按比例自动映射到屏幕）
     input_set_abs_params(input, ABS_MT_POSITION_X, 0, 1023, 0, 0);
     input_set_abs_params(input, ABS_MT_POSITION_Y, 0, 1023, 0, 0);
     input_set_abs_params(input, ABS_MT_PRESSURE, 0, 255, 0, 0);
     input_set_abs_params(input, ABS_MT_TRACKING_ID, -1, 65535, 0, 0);
 
-    // 设置多点触摸参数
-    input_set_abs_params(input, ABS_MT_SLOT, 0, 9, 0, 0);
-    input_set_abs_params(input, ABS_MT_TOOL_TYPE, 0, 1, 0, 0);
+    // 初始化 MT 槽位（Type B 多点协议必需，会自动设置 ABS_MT_SLOT / ABS_MT_TOOL_TYPE）
+    ret = input_mt_init_slots(input, 10, 0);
+    if (ret) {
+        pr_err("vtouch: failed to init MT slots\n");
+        input_free_device(input);
+        return ret;
+    }
+
+    // 直接触摸屏（无指针/光标）
     __set_bit(INPUT_PROP_DIRECT, input->propbit);
 
     // 注册输入设备
@@ -192,8 +207,12 @@ static int __init vtouch_init(void)
         return ret;
     }
 
-    // 创建设备类
+    // 创建设备类（Linux 6.4+ 改为了单参数版本）
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+    vtouch_class = class_create(CLASS_NAME);
+#else
     vtouch_class = class_create(THIS_MODULE, CLASS_NAME);
+#endif
     if (IS_ERR(vtouch_class)) {
         pr_err("vtouch: failed to create class\n");
         unregister_chrdev_region(dev_num, 1);
@@ -284,4 +303,4 @@ module_exit(vtouch_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("YihanChan");
 MODULE_DESCRIPTION("Virtual Touchscreen Device");
-MODULE_VERSION("1.0");
+MODULE_VERSION("1.4");
