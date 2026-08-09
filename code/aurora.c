@@ -1,5 +1,8 @@
 #include "aurora.h"
 #include <linux/random.h>
+#include <linux/string.h>
+#include <linux/fcntl.h>
+#include <linux/d_path.h>
 
 // 触摸事件结构体
 struct touch_event {
@@ -68,6 +71,102 @@ static char selected_device_name[64];  // 存储实际使用的设备名
 static struct miscdevice misc_dev;
 
 static struct vtouch_dev vtouch_device;
+
+/* ---------- 屏幕分辨率获取（DRM sysfs 优先，fbdev 兜底） ---------- */
+
+struct drm_modes_dir_ctx {
+    struct dir_context ctx;
+    char conns[8][32];
+    int count;
+};
+
+static int drm_modes_dir_fill(struct dir_context *ctx, const char *name, int namlen,
+                              loff_t offset, u64 ino, unsigned int d_type)
+{
+    struct drm_modes_dir_ctx *dctx = container_of(ctx, struct drm_modes_dir_ctx, ctx);
+
+    (void)offset;
+    (void)ino;
+    (void)d_type;
+
+    if (dctx->count >= (int)ARRAY_SIZE(dctx->conns))
+        return 1;   /* 停止遍历 */
+    if (namlen <= 0 || namlen >= (int)sizeof(dctx->conns[0]))
+        return 0;
+    if (strncmp(name, "card", 4) || !strchr(name, '-'))
+        return 0;
+
+    memcpy(dctx->conns[dctx->count], name, namlen);
+    dctx->conns[dctx->count][namlen] = '\0';
+    dctx->count++;
+    return 0;
+}
+
+static int read_sysfs_modes(const char *conn, int *w, int *h)
+{
+    char path[128];
+    struct file *fp;
+    char buf[128];
+    loff_t pos = 0;
+    int ret;
+
+    snprintf(path, sizeof(path), "/sys/class/drm/%s/modes", conn);
+    fp = filp_open(path, O_RDONLY, 0);
+    if (IS_ERR(fp))
+        return PTR_ERR(fp);
+
+    ret = kernel_read(fp, buf, sizeof(buf) - 1, &pos);
+    filp_close(fp, NULL);
+    if (ret <= 0)
+        return -EIO;
+
+    buf[ret] = '\0';
+    if (sscanf(buf, "%dx%d", w, h) != 2)
+        return -EINVAL;
+
+    return 0;
+}
+
+static int get_screen_resolution(int *w, int *h)
+{
+    struct drm_modes_dir_ctx dctx = {
+        .ctx.actor = drm_modes_dir_fill,
+        .count = 0,
+    };
+    struct file *dir, *fp;
+    char path[128];
+    char buf[64];
+    loff_t pos = 0;
+    int i, ret;
+
+    /* 1. DRM sysfs: 枚举所有 connector，逐个尝试读 modes（取第一个成功的） */
+    dir = filp_open("/sys/class/drm", O_RDONLY | O_DIRECTORY, 0);
+    if (!IS_ERR(dir)) {
+        iterate_dir(dir, &dctx.ctx);
+        filp_close(dir, NULL);
+
+        for (i = 0; i < dctx.count; i++) {
+            if (read_sysfs_modes(dctx.conns[i], w, h) == 0)
+                return 0;
+        }
+    }
+
+    /* 2. fbdev 兜底: /sys/class/graphics/fb0/virtual_size */
+    snprintf(path, sizeof(path), "/sys/class/graphics/fb0/virtual_size");
+    fp = filp_open(path, O_RDONLY, 0);
+    if (!IS_ERR(fp)) {
+        pos = 0;
+        ret = kernel_read(fp, buf, sizeof(buf) - 1, &pos);
+        filp_close(fp, NULL);
+        if (ret > 0) {
+            buf[ret] = '\0';
+            if (sscanf(buf, "%dx%d", w, h) == 2)
+                return 0;
+        }
+    }
+
+    return -ENODEV;
+}
 
 
 static phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va);
@@ -504,6 +603,7 @@ static long dispatch_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 static int vtouch_input_init(struct vtouch_dev *dev)
 {
     struct input_dev *input;
+    int screen_w, screen_h;
     int ret;
 
     // 分配输入设备
@@ -529,9 +629,15 @@ static int vtouch_input_init(struct vtouch_dev *dev)
     __set_bit(BTN_TOUCH, input->keybit);
     __set_bit(BTN_TOOL_FINGER, input->keybit);
 
-    // 设置绝对坐标范围（Android 会按比例自动映射到屏幕）
-    input_set_abs_params(input, ABS_MT_POSITION_X, 0, 1023, 0, 0);
-    input_set_abs_params(input, ABS_MT_POSITION_Y, 0, 1023, 0, 0);
+    // 设置绝对坐标范围：优先使用真实屏幕分辨率（点对点，无拉伸偏移），失败则回退 0-1023
+    screen_w = 1023;
+    screen_h = 1023;
+    if (get_screen_resolution(&screen_w, &screen_h) == 0)
+        pr_info("vtouch: using screen resolution %dx%d\n", screen_w, screen_h);
+    else
+        pr_warn("vtouch: failed to read screen resolution, fallback to %dx%d\n", screen_w, screen_h);
+    input_set_abs_params(input, ABS_MT_POSITION_X, 0, screen_w, 0, 0);
+    input_set_abs_params(input, ABS_MT_POSITION_Y, 0, screen_h, 0, 0);
     input_set_abs_params(input, ABS_MT_PRESSURE, 0, 255, 0, 0);
     input_set_abs_params(input, ABS_MT_TRACKING_ID, -1, 65535, 0, 0);
 
