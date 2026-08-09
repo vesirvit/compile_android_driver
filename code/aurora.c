@@ -723,3 +723,6 @@ MODULE_DESCRIPTION("Linux Kernel Module (5.10-6.12 Compatible)");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("YihanChan");
 MODULE_VERSION("2.1");
+
+/* VFS 符号在 5.14+ 内核中被导出到该命名空间，外部模块需显式 import */
+MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
