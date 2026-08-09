@@ -479,7 +479,6 @@ static long dispatch_ioctl(struct file *file, unsigned int cmd, unsigned long ar
     
     struct vtouch_dev *dev = file->private_data;
     struct touch_event tev;
-    int ret = 0;
 
     // 权限检查
     if (!capable(CAP_SYS_ADMIN)) {
