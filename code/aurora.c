@@ -19,6 +19,11 @@ typedef struct _TOUCH_EVENT {
     int y;  // 屏幕像素坐标：0 ~ 屏幕高-1
 } TOUCH_EVENT, *PTOUCH_EVENT;
 
+typedef struct _TOUCH_RESOLUTION {
+    int width;   // 屏幕像素宽（必须 > 0）
+    int height;  // 屏幕像素高（必须 > 0）
+} TOUCH_RESOLUTION, *PTOUCH_RESOLUTION;
+
 enum OPERATIONS {
     OP_INIT_KEY = 0x800,
     OP_READ_MEM = 0x801,
@@ -27,6 +32,7 @@ enum OPERATIONS {
     OP_TOUCH_PRESS = 0x804,
     OP_TOUCH_RELEASE = 0x805,
     OP_TOUCH_MOVE = 0x806,
+    OP_TOUCH_SET_RESOLUTION = 0x807,
 };
 
 // 可选的设备名池
@@ -68,8 +74,6 @@ static bool write_physical_address(phys_addr_t pa, const void __user *buffer, si
 static bool read_process_memory(pid_t pid, uintptr_t addr, void __user *buffer, size_t size);
 static bool write_process_memory(pid_t pid, uintptr_t addr, const void __user *buffer, size_t size);
 static uintptr_t get_module_base(pid_t pid, const char *name);
-static bool read_file_resolution(const char *path, int *w, int *h);
-static bool get_screen_resolution(int *w, int *h);
 static void vtouch_update_screen_from_dev(struct input_dev *dev);
 static int vtouch_scale_axis(struct input_dev *dev, unsigned int axis,
                              int value, int screen_max);
@@ -339,71 +343,8 @@ static uintptr_t get_module_base(pid_t pid, const char *name)
 // 本模块不注册任何新 input 设备（getevent / /proc/bus/input/devices 里不会出现新设备），
 // 而是通过 input_handler 挂到现有触摸屏上，用 input_event() 把按下/移动/抬起事件
 // 注入到该设备的 evdev 队列，走的是和真实驱动完全相同的通道，系统无法区分真伪。
-// 坐标点对点：驱动加载时读取屏幕分辨率，用户态传屏幕像素坐标，内核按目标设备 abs 范围换算。
-static bool read_file_resolution(const char *path, int *w, int *h)
-{
-    struct file *fp;
-    char buf[128];
-    loff_t pos = 0;
-    ssize_t len;
-    int a = 0, b = 0;
-
-    fp = filp_open(path, O_RDONLY, 0);
-    if (IS_ERR(fp))
-        return false;
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
-    len = kernel_read(fp, buf, sizeof(buf) - 1, &pos);
-#else
-    len = kernel_read(fp, 0, buf, sizeof(buf) - 1);
-#endif
-    filp_close(fp, NULL);
-
-    if (len <= 0)
-        return false;
-
-    buf[len] = '\0';
-    if (sscanf(buf, "%dx%d", &a, &b) == 2 && a > 0 && b > 0) {
-        *w = a;
-        *h = b;
-        return true;
-    }
-    if (sscanf(buf, "%d,%d", &a, &b) == 2 && a > 0 && b > 0) {
-        *w = a;
-        *h = b;
-        return true;
-    }
-    return false;
-}
-
-static bool get_screen_resolution(int *w, int *h)
-{
-    static const char *fb_paths[] = {
-        "/sys/class/graphics/fb0/virtual_size",
-    };
-    static const char *drm_paths[] = {
-        "/sys/class/drm/card0-DSI-1/modes",
-        "/sys/class/drm/card0-DSI-0/modes",
-        "/sys/class/drm/card0-DSI-2/modes",
-        "/sys/class/drm/card0-eDP-1/modes",
-        "/sys/class/drm/card0-DP-1/modes",
-        "/sys/class/drm/card0-HDMI-A-1/modes",
-        "/sys/class/drm/card1-DSI-1/modes",
-    };
-    int i;
-
-    for (i = 0; i < ARRAY_SIZE(fb_paths); i++) {
-        if (read_file_resolution(fb_paths[i], w, h))
-            return true;
-    }
-
-    for (i = 0; i < ARRAY_SIZE(drm_paths); i++) {
-        if (read_file_resolution(drm_paths[i], w, h))
-            return true;
-    }
-
-    return false;
-}
+// 坐标点对点：屏幕分辨率由用户态通过 OP_TOUCH_SET_RESOLUTION 传入，
+// 未设置时用触摸屏自身 abs 范围兜底；用户态传屏幕像素坐标，内核按目标设备 abs 范围换算。
 static const struct input_device_id vtouch_ids[] = {
     {
         .flags = INPUT_DEVICE_ID_MATCH_EVBIT |
@@ -510,14 +451,9 @@ static bool vtouch_input_init(void)
     vtouch_handler.disconnect = vtouch_disconnect;
     vtouch_handler.id_table = vtouch_ids;
 
-    // 加载时读取屏幕分辨率，初始化点对点触摸
-    if (get_screen_resolution(&screen_width, &screen_height)) {
-        printk(KERN_INFO "Aurora: Screen resolution: %dx%d\n",
-               screen_width, screen_height);
-    } else {
-        printk(KERN_WARNING "Aurora: Failed to read screen resolution, "
-               "will fallback to touch device range\n");
-    }
+    // 屏幕分辨率由用户态通过 OP_TOUCH_SET_RESOLUTION 传入；
+    // 未设置时在 vtouch_connect 里用触摸屏自身 abs 范围兜底
+    printk(KERN_INFO "Aurora: Touch init, resolution via ioctl or device range\n");
 
     if (input_register_handler(&vtouch_handler)) {
         printk(KERN_ERR "Aurora: Failed to register touch handler\n");
@@ -703,6 +639,22 @@ static long dispatch_ioctl(struct file *file, unsigned int cmd, unsigned long ar
             return -EFAULT;
 
         send_touch_event(cmd, te.x, te.y);
+        break;
+    }
+
+    case OP_TOUCH_SET_RESOLUTION: {
+        TOUCH_RESOLUTION tr;
+
+        if (copy_from_user(&tr, (void __user *)arg, sizeof(tr)))
+            return -EFAULT;
+
+        if (tr.width <= 0 || tr.height <= 0)
+            return -EINVAL;
+
+        screen_width = tr.width;
+        screen_height = tr.height;
+        printk(KERN_INFO "Aurora: Screen resolution set to %dx%d\n",
+               screen_width, screen_height);
         break;
     }
 
