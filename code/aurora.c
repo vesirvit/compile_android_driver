@@ -1,5 +1,26 @@
 #include "aurora.h"
 #include <linux/random.h>
+#include <linux/delay.h>
+#include <linux/mutex.h>
+
+// 触摸事件结构体
+struct touch_event {
+    int x;          // 屏幕像素坐标 X (0 ~ 屏幕宽-1)
+    int y;          // 屏幕像素坐标 Y (0 ~ 屏幕高-1)
+    int pressure;   // 压力值 (0-255)
+};
+
+// 屏幕分辨率结构体（用户态通过 OP_TOUCH_SET_RESOLUTION 传入）
+struct screen_resolution {
+    int width;      // 屏幕像素宽（必须 > 0）
+    int height;     // 屏幕像素高（必须 > 0）
+};
+
+// 设备结构体
+struct vtouch_dev {
+    struct input_dev *input;
+    int touch_active;
+};
 
 typedef struct _COPY_MEMORY {
     pid_t pid;
@@ -14,25 +35,15 @@ typedef struct _MODULE_BASE {
     uintptr_t base;
 } MODULE_BASE, *PMODULE_BASE;
 
-typedef struct _TOUCH_EVENT {
-    int x;  // 屏幕像素坐标：0 ~ 屏幕宽-1
-    int y;  // 屏幕像素坐标：0 ~ 屏幕高-1
-} TOUCH_EVENT, *PTOUCH_EVENT;
-
-typedef struct _TOUCH_RESOLUTION {
-    int width;   // 屏幕像素宽（必须 > 0）
-    int height;  // 屏幕像素高（必须 > 0）
-} TOUCH_RESOLUTION, *PTOUCH_RESOLUTION;
-
 enum OPERATIONS {
-    OP_INIT_KEY = 0x800,
-    OP_READ_MEM = 0x801,
-    OP_WRITE_MEM = 0x802,
-    OP_MODULE_BASE = 0x803,
-    OP_TOUCH_PRESS = 0x804,
-    OP_TOUCH_RELEASE = 0x805,
-    OP_TOUCH_MOVE = 0x806,
-    OP_TOUCH_SET_RESOLUTION = 0x807,
+    OP_INIT_KEY = 600,
+    OP_READ_MEM = 601,
+    OP_WRITE_MEM = 602,
+    OP_MODULE_BASE = 603,
+    OP_TOUCH_PRESS = 604,
+    OP_TOUCH_RELEASE = 605,
+    OP_TOUCH_MOVE = 606,
+    OP_TOUCH_SET_RESOLUTION = 607
 };
 
 // 可选的设备名池
@@ -62,11 +73,17 @@ static const char* device_name_pool[] = {
 #define DEVICE_POOL_SIZE (sizeof(device_name_pool) / sizeof(device_name_pool[0]))
 static char selected_device_name[64];  // 存储实际使用的设备名
 static struct miscdevice misc_dev;
-static struct input_handler vtouch_handler;
-static struct input_handle *vtouch_handle;
-static int vtouch_tracking_id = 200;
+
+static struct vtouch_dev vtouch_device;
+
+// 保护虚拟 input 设备的创建/注销（ensure 与 set_resolution 并发时避免重复注册）
+static DEFINE_MUTEX(vtouch_lock);
+
+// 屏幕分辨率（屏幕像素）。默认 0 = 未设置，虚拟设备 abs 范围用 0-1023 兜底；
+// 用户态通过 OP_TOUCH_SET_RESOLUTION 传入后，abs 范围 = 屏幕分辨率，实现点对点。
 static int screen_width;
 static int screen_height;
+
 
 static phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va);
 static bool read_physical_address(phys_addr_t pa, void __user *buffer, size_t size);
@@ -74,15 +91,8 @@ static bool write_physical_address(phys_addr_t pa, const void __user *buffer, si
 static bool read_process_memory(pid_t pid, uintptr_t addr, void __user *buffer, size_t size);
 static bool write_process_memory(pid_t pid, uintptr_t addr, const void __user *buffer, size_t size);
 static uintptr_t get_module_base(pid_t pid, const char *name);
-static void vtouch_update_screen_from_dev(struct input_dev *dev);
-static int vtouch_scale_axis(struct input_dev *dev, unsigned int axis,
-                             int value, int screen_max);
-static void send_touch_event(unsigned int action, int x, int y);
-static int vtouch_connect(struct input_handler *handler, struct input_dev *dev,
-                          const struct input_device_id *id);
-static void vtouch_disconnect(struct input_handle *handle);
-static bool vtouch_input_init(void);
-static void vtouch_input_exit(void);
+static int vtouch_ensure_input(struct vtouch_dev *dev);
+static int vtouch_set_resolution(struct vtouch_dev *dev, int width, int height);
 
 // 从池中随机选择一个设备名
 static void select_random_device_name(void)
@@ -97,6 +107,41 @@ static void select_random_device_name(void)
              "%s", device_name_pool[index]);
     
     printk(KERN_INFO "Aurora: Selected random device name: %s\n", selected_device_name);
+}
+
+// 发送触摸事件（Type B 协议，正确的事件顺序）
+// 坐标是屏幕像素坐标，虚拟设备 abs 范围已按屏幕分辨率设置，InputReader 1:1 映射到屏幕
+// 注意：pressure 为 0 时部分 ROM 的 InputReader 会忽略触点，按下时强制最小压力 1
+static void send_touch_event(struct vtouch_dev *dev, int x, int y, int pressure, int active)
+{
+    if (!dev->input)
+        return;
+
+    if (active && pressure < 1)
+        pressure = 1;
+
+    // 1. 选择触摸槽位
+    input_mt_slot(dev->input, 0);
+
+    // 2. 上报槽位状态（按下时内核自动分配 TRACKING_ID，抬起时自动发送 -1）
+    input_mt_report_slot_state(dev->input, MT_TOOL_FINGER, active);
+
+    if (active) {
+        // 3. 上报坐标和压力
+        input_report_abs(dev->input, ABS_MT_POSITION_X, x);
+        input_report_abs(dev->input, ABS_MT_POSITION_Y, y);
+        input_report_abs(dev->input, ABS_MT_PRESSURE, pressure);
+    }
+
+    // 4. 上报按键状态（用户态程序依赖 BTN_TOUCH 判断触摸有无）
+    input_report_key(dev->input, BTN_TOUCH, active);
+    input_report_key(dev->input, BTN_TOOL_FINGER, active);
+
+    // 5. 同步事件
+    input_sync(dev->input);
+
+    // 保存当前状态
+    dev->touch_active = active;
 }
 
 static phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
@@ -338,331 +383,279 @@ static uintptr_t get_module_base(pid_t pid, const char *name)
     return base_addr;
 }
 
-// ===== 虚拟触摸屏（不注册设备，直接劫持现有触摸屏） =====
-// Android 目标机已有真实触摸屏 input 设备（evdev 节点 /dev/input/eventX）。
-// 本模块不注册任何新 input 设备（getevent / /proc/bus/input/devices 里不会出现新设备），
-// 而是通过 input_handler 挂到现有触摸屏上，用 input_event() 把按下/移动/抬起事件
-// 注入到该设备的 evdev 队列，走的是和真实驱动完全相同的通道，系统无法区分真伪。
-// 坐标点对点：屏幕分辨率由用户态通过 OP_TOUCH_SET_RESOLUTION 传入，
-// 未设置时用触摸屏自身 abs 范围兜底；用户态传屏幕像素坐标，内核按目标设备 abs 范围换算。
-static const struct input_device_id vtouch_ids[] = {
-    {
-        .flags = INPUT_DEVICE_ID_MATCH_EVBIT |
-                 INPUT_DEVICE_ID_MATCH_KEYBIT |
-                 INPUT_DEVICE_ID_MATCH_ABSBIT,
-        .evbit = { BIT_MASK(EV_ABS) },
-        .keybit = { BIT_MASK(BTN_TOUCH) },
-        .absbit = { BIT_MASK(ABS_MT_POSITION_X) | BIT_MASK(ABS_MT_POSITION_Y) },
-    },
-    {
-        .flags = INPUT_DEVICE_ID_MATCH_EVBIT |
-                 INPUT_DEVICE_ID_MATCH_KEYBIT |
-                 INPUT_DEVICE_ID_MATCH_ABSBIT,
-        .evbit = { BIT_MASK(EV_ABS) },
-        .keybit = { BIT_MASK(BTN_TOUCH) },
-        .absbit = { BIT_MASK(ABS_X) | BIT_MASK(ABS_Y) },
-    },
-    { }
-};
-MODULE_DEVICE_TABLE(input, vtouch_ids);
-
-// 把用户态屏幕像素坐标（0 ~ screen_max）映射到目标设备的原始坐标范围；
-// screen_max <= 0 时按原样透传（仅在读不到屏幕分辨率时兜底）
-static int vtouch_scale_axis(struct input_dev *dev, unsigned int axis,
-                             int value, int screen_max)
-{
-    int min, max;
-
-    min = input_abs_get_min(dev, axis);
-    max = input_abs_get_max(dev, axis);
-    if (max <= min)
-        return 0;
-
-    if (screen_max > 0)
-        value = min + (value * (max - min)) / screen_max;
-
-    if (value < min)
-        value = min;
-    if (value > max)
-        value = max;
-    return value;
-}
-
-// 读不到屏幕分辨率时，用触摸屏自身坐标范围作为屏幕大小（系统按该范围映射屏幕，等效点对点）
-static void vtouch_update_screen_from_dev(struct input_dev *dev)
-{
-    unsigned int ax = ABS_X, ay = ABS_Y;
-
-    if (test_bit(ABS_MT_POSITION_X, dev->absbit)) {
-        ax = ABS_MT_POSITION_X;
-        ay = ABS_MT_POSITION_Y;
-    }
-
-    if (screen_width <= 0)
-        screen_width = input_abs_get_max(dev, ax) + 1;
-    if (screen_height <= 0)
-        screen_height = input_abs_get_max(dev, ay) + 1;
-}
-
-static int vtouch_connect(struct input_handler *handler, struct input_dev *dev,
-                          const struct input_device_id *id)
-{
-    struct input_handle *handle;
-
-    // 已持有目标触摸屏则忽略其他设备
-    if (vtouch_handle)
-        return 0;
-
-    handle = kzalloc(sizeof(*handle), GFP_KERNEL);
-    if (!handle)
-        return -ENOMEM;
-
-    handle->dev = dev;
-    handle->handler = handler;
-    handle->name = "aurora-vtouch";
-
-    if (input_register_handle(handle)) {
-        kfree(handle);
-        return -ENOMEM;
-    }
-
-    vtouch_handle = handle;
-
-    // 若加载时未读到屏幕分辨率，用触摸屏自身范围兜底
-    vtouch_update_screen_from_dev(dev);
-
-    printk(KERN_INFO "Aurora: Touch hijack attached to: %s (%dx%d)\n",
-           dev->name, screen_width, screen_height);
-    return 0;
-}
-
-static void vtouch_disconnect(struct input_handle *handle)
-{
-    if (handle == vtouch_handle)
-        vtouch_handle = NULL;
-    input_unregister_handle(handle);
-    kfree(handle);
-}
-
-static bool vtouch_input_init(void)
-{
-    vtouch_handler.name = "aurora-vtouch";
-    vtouch_handler.connect = vtouch_connect;
-    vtouch_handler.disconnect = vtouch_disconnect;
-    vtouch_handler.id_table = vtouch_ids;
-
-    // 屏幕分辨率由用户态通过 OP_TOUCH_SET_RESOLUTION 传入；
-    // 未设置时在 vtouch_connect 里用触摸屏自身 abs 范围兜底
-    printk(KERN_INFO "Aurora: Touch init, resolution via ioctl or device range\n");
-
-    if (input_register_handler(&vtouch_handler)) {
-        printk(KERN_ERR "Aurora: Failed to register touch handler\n");
-        return false;
-    }
-
-    if (!vtouch_handle) {
-        printk(KERN_WARNING "Aurora: No touchscreen device found\n");
-    } else {
-        printk(KERN_INFO "Aurora: Touch hijack ready\n");
-    }
-    return true;
-}
-
-static void send_touch_event(unsigned int action, int x, int y)
-{
-    struct input_dev *dev;
-    int sx, sy;
-
-    if (!vtouch_handle || !vtouch_handle->dev)
-        return;
-
-    dev = vtouch_handle->dev;
-
-    // 按目标设备的实际协议选择坐标轴（x/y 为屏幕像素坐标，点对点换算）
-    if (test_bit(ABS_MT_POSITION_X, dev->absbit)) {
-        sx = vtouch_scale_axis(dev, ABS_MT_POSITION_X, x, screen_width - 1);
-        sy = vtouch_scale_axis(dev, ABS_MT_POSITION_Y, y, screen_height - 1);
-    } else {
-        sx = vtouch_scale_axis(dev, ABS_X, x, screen_width - 1);
-        sy = vtouch_scale_axis(dev, ABS_Y, y, screen_height - 1);
-    }
-
-    switch (action) {
-    case OP_TOUCH_PRESS:
-        if (test_bit(ABS_MT_SLOT, dev->absbit)) {
-            // MT 协议 B（现代 Android 触摸屏），用最后一个 slot 减少与真实手指冲突
-            int slot = input_abs_get_max(dev, ABS_MT_SLOT);
-
-            input_event(dev, EV_ABS, ABS_MT_SLOT, slot);
-            input_event(dev, EV_ABS, ABS_MT_TRACKING_ID, vtouch_tracking_id++);
-            input_event(dev, EV_ABS, ABS_MT_POSITION_X, sx);
-            input_event(dev, EV_ABS, ABS_MT_POSITION_Y, sy);
-            if (test_bit(ABS_MT_TOUCH_MAJOR, dev->absbit))
-                input_event(dev, EV_ABS, ABS_MT_TOUCH_MAJOR, 10);
-            if (test_bit(ABS_MT_PRESSURE, dev->absbit)) {
-                int p = input_abs_get_max(dev, ABS_MT_PRESSURE);
-                input_event(dev, EV_ABS, ABS_MT_PRESSURE, p > 1 ? p / 2 : 1);
-            }
-        } else if (test_bit(ABS_MT_POSITION_X, dev->absbit)) {
-            // MT 协议 A
-            input_event(dev, EV_ABS, ABS_MT_POSITION_X, sx);
-            input_event(dev, EV_ABS, ABS_MT_POSITION_Y, sy);
-            input_event(dev, EV_SYN, SYN_MT_REPORT, 0);
-        } else {
-            // 普通单点触摸
-            input_event(dev, EV_ABS, ABS_X, sx);
-            input_event(dev, EV_ABS, ABS_Y, sy);
-        }
-        input_event(dev, EV_KEY, BTN_TOUCH, 1);
-        if (test_bit(BTN_TOOL_FINGER, dev->keybit))
-            input_event(dev, EV_KEY, BTN_TOOL_FINGER, 1);
-        break;
-
-    case OP_TOUCH_RELEASE:
-        if (test_bit(ABS_MT_SLOT, dev->absbit)) {
-            input_event(dev, EV_ABS, ABS_MT_SLOT,
-                       input_abs_get_max(dev, ABS_MT_SLOT));
-            input_event(dev, EV_ABS, ABS_MT_TRACKING_ID, -1);
-        }
-        input_event(dev, EV_KEY, BTN_TOUCH, 0);
-        if (test_bit(BTN_TOOL_FINGER, dev->keybit))
-            input_event(dev, EV_KEY, BTN_TOOL_FINGER, 0);
-        break;
-
-    case OP_TOUCH_MOVE:
-        if (test_bit(ABS_MT_POSITION_X, dev->absbit)) {
-            input_event(dev, EV_ABS, ABS_MT_POSITION_X, sx);
-            input_event(dev, EV_ABS, ABS_MT_POSITION_Y, sy);
-            if (!test_bit(ABS_MT_SLOT, dev->absbit))
-                input_event(dev, EV_SYN, SYN_MT_REPORT, 0);
-        } else {
-            input_event(dev, EV_ABS, ABS_X, sx);
-            input_event(dev, EV_ABS, ABS_Y, sy);
-        }
-        break;
-
-    default:
-        return;
-    }
-
-    input_sync(dev);
-}
-
-static void vtouch_input_exit(void)
-{
-    input_unregister_handler(&vtouch_handler);
-    vtouch_handle = NULL;
-}
-
 static int dispatch_open(struct inode *node, struct file *file)
 {
+    (void)node;
+    file->private_data = &vtouch_device;
+
+    pr_info("vtouch: device opened\n");
     return 0;
 }
 
 static int dispatch_close(struct inode *node, struct file *file)
 {
+    struct vtouch_dev *dev = file->private_data;
+    (void)node;
+
+    // 如果触摸还处于激活状态，自动释放（release 事件不需要坐标）
+    if (dev->touch_active) {
+        pr_info("vtouch: auto-releasing touch on close\n");
+        send_touch_event(dev, 0, 0, 0, 0);
+    }
+
+    pr_info("vtouch: device closed\n");
+
     return 0;
 }
 
-static long dispatch_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
-{
+static long dispatch_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     static char key[256] = {0};
     static bool is_verified = false;
+    
+    struct vtouch_dev *dev = file->private_data;
+    struct touch_event tev;
+    int ret;
 
     switch (cmd) {
-    case OP_INIT_KEY:
-        if (!is_verified) {
-            if (copy_from_user(key, (void __user *)arg, sizeof(key) - 1) == 0) {
-                key[sizeof(key) - 1] = '\0';
-                is_verified = true;
-            } else {
-                return -EFAULT;
+        case OP_INIT_KEY: {
+            if (!is_verified) {
+                if (copy_from_user(key, (void __user *)arg, sizeof(key) - 1) == 0) {
+                    key[sizeof(key) - 1] = '\0';
+                    is_verified = true;
+                } else {
+                    return -EFAULT;
+                }
             }
+            break;
         }
-        break;
 
-    case OP_READ_MEM: {
-        COPY_MEMORY cm;
-        
-        if (copy_from_user(&cm, (void __user *)arg, sizeof(cm)))
-            return -EFAULT;
-        
-        if (!read_process_memory(cm.pid, cm.addr, cm.buffer, cm.size))
-            return -EIO;
-        
-        break;
-    }
+        case OP_READ_MEM: {
+            COPY_MEMORY cm;
 
-    case OP_WRITE_MEM: {
-        COPY_MEMORY cm;
-        
-        if (copy_from_user(&cm, (void __user *)arg, sizeof(cm)))
-            return -EFAULT;
-        
-        if (!write_process_memory(cm.pid, cm.addr, cm.buffer, cm.size))
-            return -EIO;
-        
-        break;
-    }
+            if (copy_from_user(&cm, (void __user *)arg, sizeof(cm)))
+                return -EFAULT;
 
-    case OP_MODULE_BASE: {
-        MODULE_BASE mb;
-        char module_name[256];
-        
-        if (copy_from_user(&mb, (void __user *)arg, sizeof(mb)))
-            return -EFAULT;
-        
-        if (!mb.name)
-            return -EFAULT;
-        
-        if (copy_from_user(module_name, mb.name, sizeof(module_name) - 1))
-            return -EFAULT;
-        module_name[sizeof(module_name) - 1] = '\0';
-        
-        mb.base = get_module_base(mb.pid, module_name);
-        
-        if (copy_to_user((void __user *)arg, &mb, sizeof(mb)))
-            return -EFAULT;
-        
-        break;
-    }
+            if (!read_process_memory(cm.pid, cm.addr, cm.buffer, cm.size))
+                return -EIO;
 
-    case OP_TOUCH_PRESS:
-    case OP_TOUCH_RELEASE:
-    case OP_TOUCH_MOVE: {
-        TOUCH_EVENT te;
+            break;
+        }
 
-        if (!vtouch_handle || !vtouch_handle->dev)
-            return -EIO;
+        case OP_WRITE_MEM: {
+            COPY_MEMORY cm;
 
-        if (copy_from_user(&te, (void __user *)arg, sizeof(te)))
-            return -EFAULT;
+            if (copy_from_user(&cm, (void __user *)arg, sizeof(cm)))
+                return -EFAULT;
 
-        send_touch_event(cmd, te.x, te.y);
-        break;
-    }
+            if (!write_process_memory(cm.pid, cm.addr, cm.buffer, cm.size))
+                return -EIO;
 
-    case OP_TOUCH_SET_RESOLUTION: {
-        TOUCH_RESOLUTION tr;
+            break;
+        }
 
-        if (copy_from_user(&tr, (void __user *)arg, sizeof(tr)))
-            return -EFAULT;
+        case OP_MODULE_BASE: {
+            MODULE_BASE mb;
+            char module_name[256];
 
-        if (tr.width <= 0 || tr.height <= 0)
-            return -EINVAL;
+            if (copy_from_user(&mb, (void __user *)arg, sizeof(mb)))
+                return -EFAULT;
 
-        screen_width = tr.width;
-        screen_height = tr.height;
-        printk(KERN_INFO "Aurora: Screen resolution set to %dx%d\n",
-               screen_width, screen_height);
-        break;
-    }
+            if (!mb.name)
+                return -EFAULT;
 
-    default:
-        return -ENOTTY;
+            if (copy_from_user(module_name, mb.name, sizeof(module_name) - 1))
+                return -EFAULT;
+            module_name[sizeof(module_name) - 1] = '\0';
+
+            mb.base = get_module_base(mb.pid, module_name);
+
+            if (copy_to_user((void __user *)arg, &mb, sizeof(mb)))
+                return -EFAULT;
+
+            break;
+        }
+
+        case OP_TOUCH_SET_RESOLUTION: {
+            struct screen_resolution sr;
+
+            if (copy_from_user(&sr, (void __user *)arg, sizeof(sr)))
+                return -EFAULT;
+
+            pr_info("vtouch: ioctl SET_RESOLUTION %dx%d\n", sr.width, sr.height);
+            ret = vtouch_set_resolution(dev, sr.width, sr.height);
+            if (ret)
+                return ret;
+            break;
+        }
+
+        case OP_TOUCH_PRESS: {
+            if (copy_from_user(&tev, (void __user *)arg, sizeof(tev)))
+                return -EFAULT;
+
+            ret = vtouch_ensure_input(dev);
+            if (ret)
+                return ret;
+
+            pr_info("vtouch: ioctl PRESS x=%d y=%d pressure=%d (screen %dx%d)\n",
+                    tev.x, tev.y, tev.pressure, screen_width, screen_height);
+            send_touch_event(dev, tev.x, tev.y, tev.pressure, 1);
+            break;
+        }
+
+        case OP_TOUCH_RELEASE: {
+            if (copy_from_user(&tev, (void __user *)arg, sizeof(tev)))
+                return -EFAULT;
+
+            ret = vtouch_ensure_input(dev);
+            if (ret)
+                return ret;
+
+            pr_info("vtouch: ioctl RELEASE x=%d y=%d (screen %dx%d)\n",
+                    tev.x, tev.y, screen_width, screen_height);
+            send_touch_event(dev, tev.x, tev.y, 0, 0);
+            break;
+        }
+
+        case OP_TOUCH_MOVE: {
+            if (copy_from_user(&tev, (void __user *)arg, sizeof(tev)))
+                return -EFAULT;
+
+            ret = vtouch_ensure_input(dev);
+            if (ret)
+                return ret;
+
+            if (!dev->touch_active) {
+                pr_warn("vtouch: ioctl MOVE called but touch is not active\n");
+                return -EINVAL;
+            }
+            pr_info("vtouch: ioctl MOVE x=%d y=%d pressure=%d (screen %dx%d)\n",
+                    tev.x, tev.y, tev.pressure, screen_width, screen_height);
+            send_touch_event(dev, tev.x, tev.y, tev.pressure, 1);
+            break;
+        }
+
+        default: {
+            return -ENOTTY;
+        }
     }
 
     return 0;
+}
+
+// 初始化输入设备（延迟注册：由 vtouch_ensure_input 在首次触摸前调用）
+// abs 范围 = 屏幕分辨率（用户态传入），未设置时用 0-1023 兜底
+static int vtouch_input_init(struct vtouch_dev *dev)
+{
+    struct input_dev *input;
+    int ret;
+    int abs_x_max;
+    int abs_y_max;
+
+    // 分配输入设备
+    input = input_allocate_device();
+    if (!input) {
+        pr_err("vtouch: failed to allocate input device\n");
+        return -ENOMEM;
+    }
+
+    // 设置设备名称
+    input->name = "Virtual Touchscreen";
+    input->id.bustype = BUS_VIRTUAL;
+    input->id.vendor = 0x1234;
+    input->id.product = 0x5678;
+    input->id.version = 0x0001;
+
+    // 设置事件类型
+    __set_bit(EV_ABS, input->evbit);
+    __set_bit(EV_SYN, input->evbit);
+    __set_bit(EV_KEY, input->evbit);
+
+    // 设置触摸按键
+    __set_bit(BTN_TOUCH, input->keybit);
+    __set_bit(BTN_TOOL_FINGER, input->keybit);
+
+    // 绝对坐标范围 = 屏幕分辨率（点对点）：App 传屏幕像素坐标，1:1 映射
+    abs_x_max = screen_width > 0 ? screen_width - 1 : 1023;
+    abs_y_max = screen_height > 0 ? screen_height - 1 : 1023;
+    input_set_abs_params(input, ABS_MT_POSITION_X, 0, abs_x_max, 0, 0);
+    input_set_abs_params(input, ABS_MT_POSITION_Y, 0, abs_y_max, 0, 0);
+    input_set_abs_params(input, ABS_MT_PRESSURE, 0, 255, 0, 0);
+    // ABS_MT_TRACKING_ID / ABS_MT_SLOT 由 input_mt_init_slots 自动设置，无需手动
+
+    // 初始化 MT 槽位（Type B 多点协议必需，会自动设置 ABS_MT_SLOT / ABS_MT_TOOL_TYPE）
+    ret = input_mt_init_slots(input, 10, 0);
+    if (ret) {
+        pr_err("vtouch: failed to init MT slots\n");
+        input_free_device(input);
+        return ret;
+    }
+
+    // 直接触摸屏（无指针/光标）
+    __set_bit(INPUT_PROP_DIRECT, input->propbit);
+
+    // 注册输入设备
+    ret = input_register_device(input);
+    if (ret) {
+        pr_err("vtouch: failed to register input device\n");
+        input_free_device(input);
+        return ret;
+    }
+
+    dev->input = input;
+    dev->touch_active = 0;
+
+    pr_info("vtouch: input device registered, abs range %dx%d (screen %dx%d)\n",
+            abs_x_max + 1, abs_y_max + 1, screen_width, screen_height);
+    return 0;
+}
+
+// 确保虚拟 input 设备已注册（未注册则按当前分辨率创建）
+static int vtouch_ensure_input(struct vtouch_dev *dev)
+{
+    bool created = false;
+    int ret = 0;
+
+    mutex_lock(&vtouch_lock);
+    if (!dev->input) {
+        ret = vtouch_input_init(dev);
+        created = (ret == 0);
+    }
+    mutex_unlock(&vtouch_lock);
+
+    if (created) {
+        // InputReader 通过 uevent 发现新设备并打开 event 节点是异步的，
+        // 若紧接着发触摸事件，设备还没被打开，事件会丢失。等待枚举完成。
+        msleep(50);
+    }
+    return ret;
+}
+
+// 设置屏幕分辨率：更新 abs 范围。
+// InputReader 在设备注册时缓存 abs 范围，注册后再改不生效，
+// 所以若设备已注册则先注销（下次触摸时按新分辨率重建）。
+static int vtouch_set_resolution(struct vtouch_dev *dev, int width, int height)
+{
+    if (width <= 0 || height <= 0) {
+        pr_err("vtouch: invalid resolution %dx%d\n", width, height);
+        return -EINVAL;
+    }
+
+    mutex_lock(&vtouch_lock);
+    screen_width = width;
+    screen_height = height;
+
+    // 已注册则注销；随后按新分辨率重建
+    if (dev->input) {
+        input_unregister_device(dev->input);
+        dev->input = NULL;
+        dev->touch_active = 0;
+        pr_info("vtouch: resolution changed to %dx%d, re-registering input device\n",
+                width, height);
+    }
+    mutex_unlock(&vtouch_lock);
+
+    // 传分辨率即创建虚拟触摸设备（此前未创建或刚注销），getevent 立即可见
+    return vtouch_ensure_input(dev);
 }
 
 static const struct file_operations dispatch_fops = {
@@ -670,7 +663,6 @@ static const struct file_operations dispatch_fops = {
     .open = dispatch_open,
     .release = dispatch_close,
     .unlocked_ioctl = dispatch_ioctl,
-    .compat_ioctl = dispatch_ioctl,
 };
 
 static int __init driver_entry(void)
@@ -678,11 +670,6 @@ static int __init driver_entry(void)
     int ret;
     
     select_random_device_name();
-    
-    // 初始化触摸注入（失败不阻塞模块加载，触摸 ioctl 会返回 -EIO）
-    if (!vtouch_input_init()) {
-        printk(KERN_ERR "Aurora: Failed to init touch injection\n");
-    }
     
     // 注册设备
     misc_dev.minor = MISC_DYNAMIC_MINOR;
@@ -699,12 +686,20 @@ static int __init driver_entry(void)
     
     printk(KERN_INFO "Aurora: Successfully registered random device: %s\n", 
            selected_device_name);
+
+    pr_info("vtouch: ready, input device created on ioctl 607 (resolution) or first touch\n");
+
+    pr_info("vtouch: initialized successfully. Device node: /dev/%s\n",
+            selected_device_name);
+
     return 0;
 }
 
 static void __exit driver_unload(void)
 {
-    vtouch_input_exit();
+    if (vtouch_device.input)
+        input_unregister_device(vtouch_device.input);
+
     misc_deregister(&misc_dev);
     printk(KERN_INFO "Aurora: Unregistered device: %s\n", selected_device_name);
 }
@@ -712,7 +707,6 @@ static void __exit driver_unload(void)
 module_init(driver_entry);
 module_exit(driver_unload);
 
-MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
 MODULE_DESCRIPTION("Linux Kernel Module");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("YihanChan");
