@@ -1,9 +1,16 @@
 /*
  * 硬件断点正确绑定到线程(task_struct)而非进程ID
- * 适配Linux 5.10+内核 - 使用perf_event_create_kernel_counter
+ * 适配Linux 5.10+内核 - 使用register_user_hw_breakpoint/unregister_hw_breakpoint
  */
 
 #include "arm64_hw_bp.h"
+#include "kallsyms_lookup_api.h"
+
+#include <linux/dcache.h>
+#include <linux/mmzone.h>
+#include <linux/pfn.h>
+#include <linux/bitops.h>
+#include <linux/workqueue.h>
 
 // 断点数据结构
 typedef struct _HW_BREAKPOINT_INFO {
@@ -54,15 +61,19 @@ enum HW_BREAKPOINT_OPERATIONS {
     OP_SET_BULLET_ROT = 0x609,
 };
 
-// 内部断点结构
+// 内部断点结构 - 简化版
 struct hw_breakpoint_entry {
     HW_BREAKPOINT_INFO info;
     struct task_struct *task;
     struct list_head list;
     atomic_t state;        // 0=正常, 1=已移动
+    atomic_t dead;         // 1=正在销毁，回调不再入队
+    unsigned long work_pending;
+    uint64_t pending_reg2; // 回命中时捕获的 regs[2]
     uint64_t orig_addr;
     struct perf_event_attr orig_attr;
-    spinlock_t lock;       // 保护状态
+    struct work_struct work;  // 睡眠操作延迟到此执行
+    spinlock_t lock;       // 保留
 };
 
 // 全局变量
@@ -80,11 +91,22 @@ static bool read_process_memory(pid_t pid, uintptr_t addr, void __user *buffer, 
 static bool write_process_memory(pid_t pid, uintptr_t addr, const void __user *buffer, size_t size);
 static uintptr_t get_module_base(pid_t pid, const char *name);
 static void hw_breakpoint_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs);
+static void hw_bp_work_fn(struct work_struct *work);
 static int set_hw_breakpoint(pid_t tid, uintptr_t addr, uint32_t type);
 static int clear_hw_breakpoint(pid_t tid, uintptr_t addr);
 static void clear_all_breakpoints(void);
 static struct task_struct *get_thread_by_tid(pid_t tid);
-static int modify_hw_breakpoint(struct perf_event *bp, struct perf_event_attr *attr);
+
+/*
+ * 内核未导出 ptrace_breakpoint_init()，这里自带等价实现，
+ * 避免模块加载时报 Unknown symbol。
+ */
+static void hw_breakpoint_attr_init(struct perf_event_attr *attr)
+{
+    memset(attr, 0, sizeof(*attr));
+    attr->type = PERF_TYPE_BREAKPOINT;
+    attr->size = sizeof(*attr);
+}
 
 // 根据内核版本选择合适的kmap函数
 static void *safe_kmap(struct page *page)
@@ -178,10 +200,26 @@ static phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
     return page_addr + page_offset;
 }
 
-// 检查物理地址范围
+// 检查物理地址范围：逐页 pfn_valid，避免依赖未导出的 high_memory
 static inline bool is_valid_phys_addr_range(phys_addr_t addr, size_t size)
 {
-    return (addr + size <= virt_to_phys(high_memory));
+    phys_addr_t end = addr + size;
+    unsigned long pfn;
+    unsigned long start_pfn;
+    unsigned long end_pfn;
+
+    if (!size || end < addr)
+        return false;
+
+    start_pfn = (unsigned long)(addr >> PAGE_SHIFT);
+    end_pfn = (unsigned long)((end - 1) >> PAGE_SHIFT);
+
+    for (pfn = start_pfn; pfn <= end_pfn; pfn++) {
+        if (!pfn_valid(pfn))
+            return false;
+    }
+
+    return true;
 }
 
 // 读取物理地址
@@ -189,22 +227,19 @@ static bool read_physical_address(phys_addr_t pa, void __user *buffer, size_t si
 {
     void *mapped;
 
-    if (!pfn_valid(__phys_to_pfn(pa)))
-        return false;
-    
     if (!is_valid_phys_addr_range(pa, size))
         return false;
 
-    mapped = ioremap_cache(pa, size);
+    mapped = memremap(pa, size, MEMREMAP_WB);
     if (!mapped)
         return false;
 
     if (copy_to_user(buffer, mapped, size)) {
-        iounmap(mapped);
+        memunmap(mapped);
         return false;
     }
 
-    iounmap(mapped);
+    memunmap(mapped);
     return true;
 }
 
@@ -213,22 +248,19 @@ static bool write_physical_address(phys_addr_t pa, const void __user *buffer, si
 {
     void *mapped;
 
-    if (!pfn_valid(__phys_to_pfn(pa)))
-        return false;
-    
     if (!is_valid_phys_addr_range(pa, size))
         return false;
 
-    mapped = ioremap_cache(pa, size);
+    mapped = memremap(pa, size, MEMREMAP_WB);
     if (!mapped)
         return false;
 
     if (copy_from_user(mapped, buffer, size)) {
-        iounmap(mapped);
+        memunmap(mapped);
         return false;
     }
 
-    iounmap(mapped);
+    memunmap(mapped);
     return true;
 }
 
@@ -343,7 +375,6 @@ static bool write_process_memory(pid_t pid, uintptr_t addr,
 }
 
 // 获取模块基址
-#define ARC_PATH_MAX 256
 static uintptr_t get_module_base(pid_t pid, const char *name)
 {
     struct task_struct *task = NULL;
@@ -389,7 +420,7 @@ static uintptr_t get_module_base(pid_t pid, const char *name)
         if (!vma->vm_file)
             continue;
 
-        path_nm = file_path(vma->vm_file, buf, ARC_PATH_MAX - 1);
+        path_nm = d_path(&vma->vm_file->f_path, buf, ARC_PATH_MAX - 1);
         if (IS_ERR(path_nm))
             continue;
 
@@ -427,7 +458,7 @@ static int process_rw_mem(struct task_struct *task, unsigned long addr,
     size_t chunk;
     unsigned long offset;
     int ret;
-    int gup_flags = write ? FOLL_WRITE : 0;
+    int gup_flags = write ? (FOLL_WRITE | FOLL_FORCE) : 0;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
     int locked = 1;  // 用于6.5+内核的locked参数
 #endif
@@ -437,6 +468,7 @@ static int process_rw_mem(struct task_struct *task, unsigned long addr,
 
     mm = task->mm;
     
+    // 兼容不同内核版本的mmap锁
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
     mmap_read_lock(mm);
 #else
@@ -446,22 +478,31 @@ static int process_rw_mem(struct task_struct *task, unsigned long addr,
     while (len > 0) {
         offset = offset_in_page(addr);
         chunk = min(len, PAGE_SIZE - offset);
+        page = NULL;
 
+        // 根据内核版本选择正确的get_user_pages_remote调用
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
+        // Linux 6.5 - 6.12: get_user_pages_remote(mm, start, nr_pages, gup_flags, pages, locked)
         ret = get_user_pages_remote(mm, addr, 1, gup_flags, &page, &locked);
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+        // Linux 5.9 - 6.4: get_user_pages_remote(mm, start, nr_pages, gup_flags, pages, vmas, NULL)
         ret = get_user_pages_remote(mm, addr, 1, gup_flags, &page, NULL, NULL);
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
+        // Linux 4.10 - 5.8: get_user_pages_remote(tsk, mm, start, nr_pages, gup_flags, pages, vmas)
         ret = get_user_pages_remote(task, mm, addr, 1, gup_flags, &page, NULL);
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 0)
+        // Linux 4.9: get_user_pages_remote(tsk, mm, start, nr_pages, write, force, pages, vmas)
         ret = get_user_pages_remote(task, mm, addr, 1, write, 0, &page, NULL);
 #else
         ret = -EINVAL;
 #endif
 
-        if (ret < 0)
+        if (ret <= 0) {
+            ret = ret ? ret : -EFAULT;
             goto out;
+        }
 
+        // 使用兼容的kmap函数
         kaddr = safe_kmap(page);
         if (!kaddr) {
             put_page(page);
@@ -471,7 +512,6 @@ static int process_rw_mem(struct task_struct *task, unsigned long addr,
         
         if (write) {
             memcpy(kaddr + offset, buf, chunk);
-            flush_dcache_page(page);
         } else {
             memcpy(buf, kaddr + offset, chunk);
         }
@@ -513,28 +553,6 @@ ssize_t process_write_mem(struct task_struct *task, unsigned long addr,
     return process_rw_mem(task, addr, (void *)buf, len, 1);
 }
 
-// 修改硬件断点
-static int modify_hw_breakpoint(struct perf_event *bp, struct perf_event_attr *attr)
-{
-    if (!bp || !attr)
-        return -EINVAL;
-    
-    // 先停用断点
-    perf_event_disable(bp);
-    
-    // 修改属性
-    bp->attr.bp_addr = attr->bp_addr;
-    bp->attr.bp_len = attr->bp_len;
-    bp->attr.bp_type = attr->bp_type;
-    bp->attr.disabled = attr->disabled;
-    
-    // 重新启用
-    if (!attr->disabled)
-        perf_event_enable(bp);
-    
-    return 0;
-}
-
 // 断点移动函数
 static bool arm64_move_bp_to_next_instruction(struct perf_event *bp, uint64_t next_addr)
 {
@@ -545,11 +563,11 @@ static bool arm64_move_bp_to_next_instruction(struct perf_event *bp, uint64_t ne
     
     tmp_attr = bp->attr;
     tmp_attr.bp_addr = next_addr;
-    tmp_attr.bp_len = 4;
+    tmp_attr.bp_len = HW_BREAKPOINT_LEN_4;
     tmp_attr.bp_type = HW_BREAKPOINT_X;
     tmp_attr.disabled = 0;
     
-    return (modify_hw_breakpoint(bp, &tmp_attr) == 0);
+    return (modify_user_hw_breakpoint_sym(bp, &tmp_attr) == 0);
 }
 
 static bool arm64_recovery_bp_to_original(struct perf_event *bp, struct perf_event_attr *orig_attr)
@@ -558,67 +576,91 @@ static bool arm64_recovery_bp_to_original(struct perf_event *bp, struct perf_eve
         return false;
     
     orig_attr->disabled = 0;
-    return (modify_hw_breakpoint(bp, orig_attr) == 0);
+    return (modify_user_hw_breakpoint_sym(bp, orig_attr) == 0);
 }
 
-// 断点回调函数
+// 断点回调函数（运行在中断/原子上下文，禁止睡眠）
 static void hw_breakpoint_handler(struct perf_event *bp,
                                  struct perf_sample_data *data,
                                  struct pt_regs *regs)
 {
     struct hw_breakpoint_entry *entry = bp->overflow_handler_context;
     struct task_struct *task = current;
-    unsigned long flags;
-    int old_state;
     uint64_t hook_pc;
-    
+    int st;
+
     if (!entry)
         return;
-    
+
+    // 正在销毁的断点不再处理
+    if (atomic_read(&entry->dead))
+        return;
+
     // 检查是否是目标线程
     if (task->pid != entry->info.tid)
         return;
-    
-    // 先获取当前状态
-    old_state = atomic_read(&entry->state);
-    
-    // 检查是否需要修改PC
+
+    // 重定向PC：不睡眠，可安全在中断上下文执行
     hook_pc = atomic64_read(&g_hook_pc);
     if (hook_pc != 0) {
         regs->pc = hook_pc;
         printk(KERN_DEBUG "BP hook PC to 0x%llx\n", hook_pc);
     }
-    
-    // 如果是第一次命中且子弹旋转数据有效，写入内存
-    if (old_state == 0) {
-        if (bullet_rot.Pitch != 0 || bullet_rot.Yaw != 0) {
-            process_write_mem(task, regs->regs[2], &bullet_rot, sizeof(bullet_rot));
+
+    // 移动断点 / 写内存会睡眠或加锁，延迟到工作队列执行
+    st = atomic_read(&entry->state);
+    if (st == 0 || st == 1) {
+        if (!test_and_set_bit(0, &entry->work_pending)) {
+            entry->pending_reg2 = regs->regs[2];
+            schedule_work(&entry->work);
         }
     }
-    
-    // 断点移动状态机
-    spin_lock_irqsave(&entry->lock, flags);
-    old_state = atomic_read(&entry->state);
-    
-    if (old_state == 0) {
-        // 第一次命中：保存原始信息，移动到下一条指令
+}
+
+// 工作队列回调（进程上下文，可睡眠）
+static void hw_bp_work_fn(struct work_struct *work)
+{
+    struct hw_breakpoint_entry *entry =
+        container_of(work, struct hw_breakpoint_entry, work);
+    int st;
+
+    clear_bit(0, &entry->work_pending);
+
+    if (atomic_read(&entry->dead))
+        return;
+
+    st = atomic_read(&entry->state);
+
+    if (st == 0) {
+        // 第一次命中：写子弹旋转 + 移动到下一条指令
+        if (bullet_rot.Pitch != 0 || bullet_rot.Yaw != 0 || bullet_rot.Roll != 0) {
+            if (entry->task && entry->task->mm) {
+                process_write_mem(entry->task, entry->pending_reg2,
+                                  &bullet_rot, sizeof(bullet_rot));
+                printk(KERN_DEBUG "BP write bullet_rot to 0x%llx\n",
+                       (unsigned long long)entry->pending_reg2);
+            }
+        }
+
         entry->orig_addr = entry->info.addr;
-        entry->orig_attr = bp->attr;
-        
-        if (arm64_move_bp_to_next_instruction(bp, regs->pc + 4)) {
+        if (entry->info.pe)
+            entry->orig_attr = entry->info.pe->attr;
+
+        // 修正：目标应为原始断点地址的下一条指令，而非被重定向后的 PC
+        if (arm64_move_bp_to_next_instruction(entry->info.pe, entry->info.addr + 4)) {
             atomic_set(&entry->state, 1);
-            printk(KERN_DEBUG "BP moved from 0x%lx to 0x%llx\n", 
-                   (unsigned long)entry->info.addr, regs->pc + 4);
+            printk(KERN_DEBUG "BP moved from 0x%lx to 0x%llx\n",
+                   (unsigned long)entry->info.addr,
+                   (unsigned long long)(entry->info.addr + 4));
         }
-    } else if (old_state == 1) {
+    } else if (st == 1) {
         // 第二次命中：恢复原始断点
-        if (arm64_recovery_bp_to_original(bp, &entry->orig_attr)) {
+        if (arm64_recovery_bp_to_original(entry->info.pe, &entry->orig_attr)) {
             atomic_set(&entry->state, 0);
-            printk(KERN_DEBUG "BP restored to 0x%lx\n", (unsigned long)entry->orig_addr);
+            printk(KERN_DEBUG "BP restored to 0x%lx\n",
+                   (unsigned long)entry->orig_addr);
         }
     }
-    
-    spin_unlock_irqrestore(&entry->lock, flags);
 }
 
 // 设置硬件断点
@@ -651,7 +693,7 @@ static int set_hw_breakpoint(pid_t tid, uintptr_t addr, uint32_t type)
     list_for_each_entry(tmp, &bp_list, list) {
         if (tmp->info.tid == tid && tmp->info.addr == addr) {
             ret = -EEXIST;
-            goto out_put_task;
+            goto out_unlock;
         }
     }
     
@@ -659,39 +701,39 @@ static int set_hw_breakpoint(pid_t tid, uintptr_t addr, uint32_t type)
     entry = kzalloc(sizeof(struct hw_breakpoint_entry), GFP_KERNEL);
     if (!entry) {
         ret = -ENOMEM;
-        goto out_put_task;
+        goto out_unlock;
     }
     
     // 初始化
     atomic_set(&entry->state, 0);
+    atomic_set(&entry->dead, 0);
+    entry->work_pending = 0;
+    entry->pending_reg2 = 0;
     spin_lock_init(&entry->lock);
+    INIT_WORK(&entry->work, hw_bp_work_fn);
     entry->orig_addr = 0;
     memset(&entry->orig_attr, 0, sizeof(entry->orig_attr));
     
-    /// 设置perf事件属性
-    memset(&attr, 0, sizeof(struct perf_event_attr));
-    attr.type = PERF_TYPE_BREAKPOINT;
-    attr.size = sizeof(struct perf_event_attr);
+    // 设置perf事件属性
+    hw_breakpoint_attr_init(&attr);
     
     // 设置断点类型和大小
-    bp_len = 4;  // 默认4字节
-    
     switch (type) {
         case BP_TYPE_INST:
             attr.bp_type = HW_BREAKPOINT_X;
-            bp_len = 4;
+            bp_len = HW_BREAKPOINT_LEN_4;
             break;
         case BP_TYPE_READ:
             attr.bp_type = HW_BREAKPOINT_R;
-            bp_len = 8;
+            bp_len = HW_BREAKPOINT_LEN_8;
             break;
         case BP_TYPE_WRITE:
             attr.bp_type = HW_BREAKPOINT_W;
-            bp_len = 8;
+            bp_len = HW_BREAKPOINT_LEN_8;
             break;
         case BP_TYPE_RW:
             attr.bp_type = HW_BREAKPOINT_RW;
-            bp_len = 8;
+            bp_len = HW_BREAKPOINT_LEN_8;
             break;
         default:
             kfree(entry);
@@ -701,20 +743,15 @@ static int set_hw_breakpoint(pid_t tid, uintptr_t addr, uint32_t type)
     
     attr.bp_addr = addr;
     attr.bp_len = bp_len;
-    attr.sample_period = 1;
-    attr.sample_type = PERF_SAMPLE_IP;
-    attr.wakeup_events = 1;
-    attr.exclude_kernel = 1;
-    attr.exclude_hv = 1;
+    attr.disabled = 0;
 
-    // 使用perf_event_create_kernel_counter创建断点
-    entry->info.pe = perf_event_create_kernel_counter(&attr, tid, NULL,
-                                                      hw_breakpoint_handler, entry);
+    // 创建断点
+    entry->info.pe = register_user_hw_breakpoint_sym(&attr, hw_breakpoint_handler, entry, task);
     
     if (IS_ERR(entry->info.pe)) {
         ret = PTR_ERR(entry->info.pe);
         kfree(entry);
-        goto out_put_task;
+        goto out_unlock;
     }
     
     // 初始化断点信息
@@ -733,12 +770,12 @@ static int set_hw_breakpoint(pid_t tid, uintptr_t addr, uint32_t type)
 
     ret = 0;
     printk(KERN_INFO "BP set for thread %d at 0x%lx\n", tid, (unsigned long)addr);
-    goto out_unlock;
     
-out_put_task:
-    put_task_struct(task);
 out_unlock:
     mutex_unlock(&bp_mutex);
+    // 释放 get_thread_by_tid() 持有的引用（entry->task 已另行 get_task_struct）
+    if (task)
+        put_task_struct(task);
     return ret;
 }
 
@@ -752,9 +789,12 @@ static int clear_hw_breakpoint(pid_t tid, uintptr_t addr)
     
     list_for_each_entry_safe(entry, tmp, &bp_list, list) {
         if (entry->info.tid == tid && entry->info.addr == addr) {
+            // 先标记销毁并等待可能在途的工作，避免 kfree 后 UAF
+            atomic_set(&entry->dead, 1);
+            cancel_work_sync(&entry->work);
+
             if (entry->info.pe) {
-                perf_event_disable(entry->info.pe);
-                perf_event_release_kernel(entry->info.pe);
+                unregister_hw_breakpoint_sym(entry->info.pe);
                 entry->info.pe = NULL;
             }
             
@@ -785,9 +825,11 @@ static void clear_all_breakpoints(void)
     mutex_lock(&bp_mutex);
     
     list_for_each_entry_safe(entry, tmp, &bp_list, list) {
+        atomic_set(&entry->dead, 1);
+        cancel_work_sync(&entry->work);
+
         if (entry->info.pe) {
-            perf_event_disable(entry->info.pe);
-            perf_event_release_kernel(entry->info.pe);
+            unregister_hw_breakpoint_sym(entry->info.pe);
             entry->info.pe = NULL;
         }
         
@@ -943,6 +985,8 @@ static long dispatch_ioctl(struct file *file, unsigned int cmd, unsigned long ar
             return -EFAULT;
         
         memcpy(&bullet_rot, &rot, sizeof(struct _BULLET_ROT));
+        printk(KERN_INFO "Bullet rot set: Pitch=%u, Yaw=%u, Roll=%u\n", 
+               rot.Pitch, rot.Yaw, rot.Roll);
         break;
     }
     
@@ -975,6 +1019,11 @@ static int __init driver_entry(void)
 {
     int ret;
     
+    if (!init_kallsyms_lookup()) {
+        printk(KERN_ERR "Failed to Get Breakpoint Functions!!!");
+        return -EBADF;
+    }
+    
     INIT_LIST_HEAD(&bp_list);
     atomic64_set(&g_hook_pc, 0);
     memset(&bullet_rot, 0, sizeof(bullet_rot));
@@ -985,7 +1034,7 @@ static int __init driver_entry(void)
         return ret;
     }
     
-    printk(KERN_INFO "ARM64 Hardware Breakpoint Module loaded (using perf_event_create_kernel_counter)\n");
+    printk(KERN_INFO "ARM64 Hardware Breakpoint Module loaded\n");
     return 0;
 }
 
@@ -1003,4 +1052,4 @@ module_exit(driver_unload);
 MODULE_DESCRIPTION("ARM64 Hardware Breakpoint Kernel Module");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("陈依涵");
-MODULE_VERSION("6.0");
+MODULE_VERSION("5.1");

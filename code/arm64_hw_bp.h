@@ -32,6 +32,7 @@
 #include <asm/page.h>
 #include <asm/pgtable.h>
 #include <asm/ptrace.h>
+#include <asm/cacheflush.h>
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
 #include <asm/pgalloc.h>
@@ -50,7 +51,7 @@ enum BP_TYPES {
 };
 
 // 最大断点数量
-#define MAX_BREAKPOINTS 4
+#define MAX_BREAKPOINTS 16
 #define ARC_PATH_MAX 256
 
 #endif /* _ARM64_HW_BP_H */
