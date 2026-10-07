@@ -16,6 +16,7 @@
 #include <linux/input.h>
 #include <linux/input/mt.h>
 #include <linux/mutex.h>
+#include <linux/device.h>
 
 #include <asm/cpu.h>
 #include <asm/io.h>

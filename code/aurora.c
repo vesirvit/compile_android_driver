@@ -71,11 +71,14 @@ static const char* device_name_pool[] = {
 static char selected_device_name[64];  // 存储实际使用的设备名
 static struct miscdevice misc_dev;
 
-// 独立虚拟触摸屏：与物理触摸屏完全分离，避免抢占物理手指
+// 注入目标：物理触摸屏（不新建设备，避免留下痕迹）
 static struct input_dev *touch_dev;
 static DEFINE_MUTEX(touch_lock);
-static int touch_width;
-static int touch_height;
+static int user_width;
+static int user_height;
+static int dev_x_min, dev_x_max;
+static int dev_y_min, dev_y_max;
+static int dev_pressure;
 static int touch_slot_active[TOUCH_MAX_SLOTS];
 static int touch_slot_tracking[TOUCH_MAX_SLOTS];
 static int touch_next_tracking = 1;
@@ -86,8 +89,8 @@ static bool write_physical_address(phys_addr_t pa, const void __user *buffer, si
 static bool read_process_memory(pid_t pid, uintptr_t addr, void __user *buffer, size_t size);
 static bool write_process_memory(pid_t pid, uintptr_t addr, const void __user *buffer, size_t size);
 static uintptr_t get_module_base(pid_t pid, const char *name);
-static int touch_device_create(int width, int height);
-static void touch_device_destroy(void);
+static int touch_attach(int width, int height);
+static void touch_detach(void);
 static int touch_emit(const TOUCH_EVENT *ev);
 
 // 从池中随机选择一个设备名
@@ -344,7 +347,13 @@ static uintptr_t get_module_base(pid_t pid, const char *name)
     return base_addr;
 }
 
-/* ==================== 虚拟触摸屏注入 ==================== */
+/* ==================== 物理触摸屏注入（minitouch 方式） ==================== */
+/* 不新建设备，直接把 MT-B 事件写进“物理触摸屏”的 input_dev：
+ *   - 只占用空闲 slot（同时避开物理手指和已注入的 slot）→ 不抢占物理触摸
+ *   - 走真实设备 → InputReader 当真实触摸，且不新增输入设备，无痕迹
+ *   - BTN_TOUCH 按“设备上全部接触数”决定，抬起注入触点时不会清掉物理手指的状态
+ * 注：仅支持 MT-B（带 ABS_MT_SLOT）的触摸屏；驱动若使用 INPUT_MT_DROP_UNUSED
+ *     会在其自己的帧里回收未更新的 slot，这类设备需要特殊处理。            */
 
 static void touch_reset_slots(void)
 {
@@ -357,111 +366,155 @@ static void touch_reset_slots(void)
     touch_next_tracking = 1;
 }
 
+/* 用户坐标 → 设备 ABS 坐标 */
+static int touch_map_axis(int v, int umax, int dmin, int dmax)
+{
+    long range = (long)dmax - dmin;
+    int out;
+
+    if (umax <= 0)
+        return dmin;
+
+    out = dmin + (int)(((long)v * range) / umax);
+    if (out < dmin) out = dmin;
+    if (out > dmax) out = dmax;
+    return out;
+}
+
+static void touch_report_slot(int slot, bool down, int x, int y, int id)
+{
+    input_mt_slot(touch_dev, slot);
+    if (down) {
+        input_report_abs(touch_dev, ABS_MT_TRACKING_ID, id);
+        input_mt_report_slot_state(touch_dev, MT_TOOL_FINGER, true);
+        input_report_abs(touch_dev, ABS_MT_POSITION_X, x);
+        input_report_abs(touch_dev, ABS_MT_POSITION_Y, y);
+        if (dev_pressure > 0)
+            input_report_abs(touch_dev, ABS_MT_PRESSURE, dev_pressure);
+    } else {
+        input_mt_report_slot_state(touch_dev, MT_TOOL_FINGER, false);
+    }
+}
+
+/* 按设备上“所有 slot（含物理手指）”的接触数决定 BTN_TOUCH */
 static void touch_sync_frame(void)
 {
     int i;
-    int down = 0;
+    int count = 0;
 
-    for (i = 0; i < TOUCH_MAX_SLOTS; i++) {
-        if (touch_slot_active[i])
-            down++;
+    for (i = 0; i < touch_dev->mt->num_slots; i++) {
+        if (input_mt_get_value(&touch_dev->mt->slots[i], ABS_MT_TRACKING_ID) >= 0)
+            count++;
     }
 
-    input_report_key(touch_dev, BTN_TOUCH, down > 0);
-    input_mt_sync_frame(touch_dev);
+    input_report_key(touch_dev, BTN_TOUCH, count > 0);
     input_sync(touch_dev);
 }
 
-static int touch_device_create(int width, int height)
+static int find_touch_cb(struct device *dev, const void *data)
 {
-    struct input_dev *dev;
-    int ret;
+    struct input_dev *idev = to_input_dev(dev);
+    struct input_dev **out = (struct input_dev **)data;
+
+    if (!idev || !idev->mt || idev->mt->num_slots <= 0)
+        return 0;
+    if (!test_bit(INPUT_PROP_DIRECT, idev->propbit))
+        return 0;
+    if (!test_bit(ABS_MT_POSITION_X, idev->absbit) ||
+        !test_bit(ABS_MT_POSITION_Y, idev->absbit))
+        return 0;
+
+    *out = idev;
+    return 1;   /* 找到第一个物理触摸屏即停止 */
+}
+
+static int touch_attach(int width, int height)
+{
+    struct input_dev *dev = NULL;
 
     if (width <= 0 || height <= 0)
         return -EINVAL;
 
-    dev = input_allocate_device();
+    class_for_each_device(&input_class, NULL, &dev, find_touch_cb);
     if (!dev)
-        return -ENOMEM;
+        return -ENODEV;
 
-    dev->name = "aurora-touchscreen";
-    dev->id.bustype = BUS_VIRTUAL;
-    dev->id.vendor  = 0x1d6b;
-    dev->id.product = 0x0104;
-    dev->id.version = 0x0100;
-
-    __set_bit(EV_SYN, dev->evbit);
-    __set_bit(EV_KEY, dev->evbit);
-    __set_bit(EV_ABS, dev->evbit);
-    __set_bit(BTN_TOUCH, dev->keybit);
-    __set_bit(INPUT_PROP_DIRECT, dev->propbit);
-
-    input_set_abs_params(dev, ABS_MT_SLOT, 0, TOUCH_MAX_SLOTS - 1, 0, 0);
-    input_set_abs_params(dev, ABS_MT_TRACKING_ID, 0, 0xffff, 0, 0);
-    input_set_abs_params(dev, ABS_MT_POSITION_X, 0, width, 0, 0);
-    input_set_abs_params(dev, ABS_MT_POSITION_Y, 0, height, 0, 0);
-    input_set_abs_params(dev, ABS_MT_PRESSURE, 0, 255, 0, 0);
-    input_set_abs_params(dev, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
-
-    input_abs_set_res(dev, ABS_MT_POSITION_X, 1);
-    input_abs_set_res(dev, ABS_MT_POSITION_Y, 1);
-
-    ret = input_mt_init_slots(dev, TOUCH_MAX_SLOTS, INPUT_MT_DIRECT);
-    if (ret) {
-        input_free_device(dev);
-        return ret;
-    }
-
-    ret = input_register_device(dev);
-    if (ret) {
-        input_free_device(dev);
-        return ret;
-    }
+    get_device(&dev->dev);   /* 持有引用，避免设备被移除后指针悬空 */
 
     touch_dev = dev;
-    touch_width = width;
-    touch_height = height;
+    user_width = width;
+    user_height = height;
+    dev_x_min = dev->absinfo[ABS_MT_POSITION_X].minimum;
+    dev_x_max = dev->absinfo[ABS_MT_POSITION_X].maximum;
+    dev_y_min = dev->absinfo[ABS_MT_POSITION_Y].minimum;
+    dev_y_max = dev->absinfo[ABS_MT_POSITION_Y].maximum;
+    dev_pressure = test_bit(ABS_MT_PRESSURE, dev->absbit) ?
+        (dev->absinfo[ABS_MT_PRESSURE].minimum +
+         dev->absinfo[ABS_MT_PRESSURE].maximum) / 2 : 0;
     touch_reset_slots();
 
-    printk(KERN_INFO "Aurora: virtual touchscreen registered %dx%d\n", width, height);
+    printk(KERN_INFO "Aurora: hooked touchscreen '%s' slots=%d x=[%d..%d] y=[%d..%d]\n",
+           dev->name, dev->mt->num_slots,
+           dev_x_min, dev_x_max, dev_y_min, dev_y_max);
     return 0;
 }
 
-static void touch_device_destroy(void)
+static void touch_detach(void)
 {
-    if (touch_dev) {
-        input_unregister_device(touch_dev);
-        touch_dev = NULL;
+    int i;
+
+    if (touch_dev && touch_dev->mt) {
+        for (i = 0; i < TOUCH_MAX_SLOTS; i++) {
+            if (touch_slot_active[i]) {
+                touch_report_slot(i, false, 0, 0, 0);
+                touch_slot_active[i] = 0;
+            }
+        }
+        touch_sync_frame();
     }
+
+    if (touch_dev)
+        put_device(&touch_dev->dev);
+
+    touch_dev = NULL;
+    user_width = 0;
+    user_height = 0;
+    dev_x_min = dev_x_max = dev_y_min = dev_y_max = 0;
+    dev_pressure = 0;
     touch_reset_slots();
-    touch_width = 0;
-    touch_height = 0;
 }
 
 static int touch_emit(const TOUCH_EVENT *ev)
 {
     int slot = ev->slot;
-    int pressure = ev->pressure > 0 ? ev->pressure : 100;
-    int i;
+    int i, dx, dy;
 
-    if (!touch_dev)
+    if (!touch_dev || !touch_dev->mt)
         return -ENODEV;
 
     switch (ev->action) {
-    case TOUCH_ACTION_DOWN:
-        if (ev->x < 0 || ev->x > touch_width ||
-            ev->y < 0 || ev->y > touch_height)
+    case TOUCH_ACTION_DOWN: {
+        int limit = touch_dev->mt->num_slots;
+
+        if (limit > TOUCH_MAX_SLOTS)
+            limit = TOUCH_MAX_SLOTS;
+
+        if (ev->x < 0 || ev->x > user_width ||
+            ev->y < 0 || ev->y > user_height)
             return -EINVAL;
 
         if (slot < 0) {
-            for (i = 0; i < TOUCH_MAX_SLOTS; i++) {
-                if (!touch_slot_active[i]) {
-                    slot = i;
-                    break;
-                }
+            for (i = 0; i < limit; i++) {
+                if (touch_slot_active[i])
+                    continue;
+                if (input_mt_get_value(&touch_dev->mt->slots[i],
+                                       ABS_MT_TRACKING_ID) >= 0)
+                    continue;   /* 物理手指正在用 */
+                slot = i;
+                break;
             }
         }
-        if (slot < 0 || slot >= TOUCH_MAX_SLOTS || touch_slot_active[slot])
+        if (slot < 0 || slot >= limit || touch_slot_active[slot])
             return -EBUSY;
 
         touch_slot_active[slot] = 1;
@@ -469,27 +522,22 @@ static int touch_emit(const TOUCH_EVENT *ev)
         if (touch_next_tracking > 0x7fff)
             touch_next_tracking = 1;
 
-        input_mt_slot(touch_dev, slot);
-        input_report_abs(touch_dev, ABS_MT_TRACKING_ID, touch_slot_tracking[slot]);
-        input_mt_report_slot_state(touch_dev, MT_TOOL_FINGER, true);
-        input_report_abs(touch_dev, ABS_MT_POSITION_X, ev->x);
-        input_report_abs(touch_dev, ABS_MT_POSITION_Y, ev->y);
-        input_report_abs(touch_dev, ABS_MT_PRESSURE, pressure);
-        input_report_abs(touch_dev, ABS_MT_TOUCH_MAJOR, 8);
+        dx = touch_map_axis(ev->x, user_width, dev_x_min, dev_x_max);
+        dy = touch_map_axis(ev->y, user_height, dev_y_min, dev_y_max);
+        touch_report_slot(slot, true, dx, dy, touch_slot_tracking[slot]);
         touch_sync_frame();
         return slot;
+    }
 
     case TOUCH_ACTION_MOVE:
         if (slot < 0 || slot >= TOUCH_MAX_SLOTS || !touch_slot_active[slot])
             return -EINVAL;
-        if (ev->x < 0 || ev->x > touch_width ||
-            ev->y < 0 || ev->y > touch_height)
-            return -EINVAL;
 
+        dx = touch_map_axis(ev->x, user_width, dev_x_min, dev_x_max);
+        dy = touch_map_axis(ev->y, user_height, dev_y_min, dev_y_max);
         input_mt_slot(touch_dev, slot);
-        input_report_abs(touch_dev, ABS_MT_POSITION_X, ev->x);
-        input_report_abs(touch_dev, ABS_MT_POSITION_Y, ev->y);
-        input_report_abs(touch_dev, ABS_MT_PRESSURE, pressure);
+        input_report_abs(touch_dev, ABS_MT_POSITION_X, dx);
+        input_report_abs(touch_dev, ABS_MT_POSITION_Y, dy);
         touch_sync_frame();
         return 0;
 
@@ -497,8 +545,7 @@ static int touch_emit(const TOUCH_EVENT *ev)
         if (slot < 0 || slot >= TOUCH_MAX_SLOTS || !touch_slot_active[slot])
             return -EINVAL;
 
-        input_mt_slot(touch_dev, slot);
-        input_mt_report_slot_state(touch_dev, MT_TOOL_FINGER, false);
+        touch_report_slot(slot, false, 0, 0, 0);
         touch_slot_active[slot] = 0;
         touch_slot_tracking[slot] = -1;
         touch_sync_frame();
@@ -591,8 +638,8 @@ static long dispatch_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 
         mutex_lock(&touch_lock);
         if (touch_dev)
-            touch_device_destroy();
-        ret = touch_device_create(ti.width, ti.height);
+            touch_detach();
+        ret = touch_attach(ti.width, ti.height);
         mutex_unlock(&touch_lock);
 
         if (ret)
@@ -658,13 +705,14 @@ static int __init driver_entry(void)
     
     printk(KERN_INFO "Aurora: Successfully registered random device: %s\n", 
            selected_device_name);
+
     return 0;
 }
 
 static void __exit driver_unload(void)
 {
     mutex_lock(&touch_lock);
-    touch_device_destroy();
+    touch_detach();
     mutex_unlock(&touch_lock);
 
     misc_deregister(&misc_dev);
